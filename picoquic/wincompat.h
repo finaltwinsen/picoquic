@@ -23,6 +23,18 @@
 #define WINCOMPAT_H
 
 #include <stdint.h>
+
+#ifdef __MINGW32__
+/* MinGW already provides ssize_t, struct timezone, gettimeofday,
+ * and __attribute__. Only pull in the Winsock headers. */
+#include <sys/types.h>
+#include <Winsock2.h>
+#include <ws2tcpip.h>
+#include <sys/time.h>
+#ifndef strcasecmp
+#define strcasecmp _stricmp
+#endif
+#else  /* MSVC */
 #define ssize_t int
 #include <Winsock2.h>
 
@@ -51,5 +63,6 @@ extern "C" {
 #endif
 
 #endif
+#endif /* __MINGW32__ */
 
 #endif /* WINCOMPAT_H */
