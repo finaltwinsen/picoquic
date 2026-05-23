@@ -5384,9 +5384,24 @@ uint8_t * picoquic_format_first_datagram_frame(picoquic_cnx_t* cnx, uint8_t* byt
             }
         }
         if (!is_sent && is_first_in_packet) {
-            picoquic_log_app_message(cnx, "Deleting datagram length %zu, larger than %zu, MTU %zu",
-                cnx->first_datagram->length, bytes_max - bytes, cnx->path[0]->send_mtu);
-            picoquic_delete_misc_or_dg(&cnx->first_datagram, &cnx->last_datagram, cnx->first_datagram);
+            /* §K.11 VipleStream fix: picoquic 原本在 is_first_in_packet=true
+             * 且 datagram 放不進去時就直接刪除 datagram。
+             * 但「放不進去」可能只是暫時的擁塞窗口縮小（BBR PROBE_BW 退讓），
+             * 不代表 datagram 真的太大。若 datagram 長度 <= send_mtu，
+             * 保留在 queue 中，等下次 cwin 恢復時再送。
+             * 只有真正超過 MTU 的 datagram 才刪除（永遠不可能送出）。 */
+            size_t mtu = cnx->path[0]->send_mtu;
+            size_t dgram_len = cnx->first_datagram->length;
+            if (dgram_len > mtu) {
+                /* 真的比 MTU 大，永遠送不出去，刪除 */
+                picoquic_log_app_message(cnx,
+                    "§K.11 Deleting datagram length %zu truly exceeds MTU %zu",
+                    dgram_len, mtu);
+                picoquic_delete_misc_or_dg(&cnx->first_datagram, &cnx->last_datagram, cnx->first_datagram);
+            } else {
+                /* 只是暫時 cwin 不夠（available=%zu），保留 datagram 等下次 */
+                (void)(bytes_max - bytes); /* suppress unused warning */
+            }
         }
 
         *more_data |= (cnx->first_datagram != NULL);
