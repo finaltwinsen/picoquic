@@ -892,6 +892,69 @@ static void picoquic_check_path_mtu_on_losses(
     }
 }
 
+/* VipleStream §K.13: 判斷封包遺失是否不應觸發壅塞通知。
+ *
+ * 白名單模式——只有以下 frame 的遺失觸發壅塞通知：
+ *   - STREAM frame（可靠控制通道，遺失 = 真正的壅塞訊號）
+ *   - CRYPTO frame（TLS 握手，遺失 = 真正的壅塞訊號）
+ *
+ * 跳過所有其他 frame 類型的遺失壅塞通知：
+ *   - Datagram（不可靠 video，RFC 9221）
+ *   - PING（PTO probe，低 cwnd 時遺失是自我造成的假陽性）
+ *   - MAX_DATA、NEW_CONNECTION_ID 等控制 frame
+ *     （LAN 上通常是 RACK 假陽性，picoquic 會自動重傳）
+ *   - ACK、PADDING（純確認，不攜帶資料）
+ *
+ * 配合 §K.12/§K.16 的 BBRMinPipeCwnd*MTU cwnd 地板作為安全網。*/
+static int picoquic_loss_is_non_congestion(picoquic_packet_t* old_p)
+{
+    size_t byte_index = old_p->offset;
+
+    /* 特殊封包類型：MTU probe / ack trap / preemptive repeat
+     * 已在 picoquic_copy_before_retransmit 中標記為 pure_ack，
+     * 不會進入 loss detection。但如果進來了，保守處理。*/
+    if (old_p->is_mtu_probe || old_p->is_ack_trap || old_p->was_preemptively_repeated) {
+        return 1;
+    }
+
+    while (byte_index < old_p->length) {
+        size_t frame_length = 0;
+        int frame_is_pure_ack = 0;
+
+        if (picoquic_skip_frame(&old_p->bytes[byte_index],
+            old_p->length - byte_index, &frame_length, &frame_is_pure_ack) != 0) {
+            return 0; /* 格式錯誤，保守處理：通知壅塞 */
+        }
+
+        /* 只有 STREAM 和 CRYPTO frame 的遺失代表真正的壅塞訊號。
+         * 在 video streaming 場景下：
+         *  - STREAM 承載可靠控制通道（stream #0），遺失必須回應
+         *  - CRYPTO 承載握手資料，遺失必須回應
+         *  - Datagram（不可靠 video）、PING（PTO probe）、
+         *    MAX_DATA、NEW_CONNECTION_ID 等控制 frame 的遺失
+         *    在 LAN 上通常是 RACK 假陽性，不代表壅塞。
+         *    這些 frame 會由 picoquic 自動重傳，不影響連線品質。
+         *
+         * §K.12/§K.16 地板（BBRMinPipeCwnd*MTU ≈ 69KB）仍作為安全網，
+         * 即使真有壅塞也不會讓 cwnd 降到無法傳送的地步。*/
+        if (PICOQUIC_IN_RANGE(old_p->bytes[byte_index],
+            picoquic_frame_type_stream_range_min,
+            picoquic_frame_type_stream_range_max)) {
+            return 0; /* STREAM 遺失 → 通知壅塞 */
+        }
+        if (old_p->bytes[byte_index] == picoquic_frame_type_crypto_hs) {
+            return 0; /* CRYPTO 遺失 → 通知壅塞 */
+        }
+
+        /* 其他所有 frame 類型（datagram、PING、MAX_DATA、
+         * NEW_CONNECTION_ID、ACK、PADDING 等）→ 跳過壅塞通知 */
+        byte_index += frame_length;
+    }
+
+    /* 封包只含 datagram 和/或 pure-ack frame，不需壅塞通知 */
+    return 1;
+}
+
 static void picoquic_count_and_notify_loss(
     picoquic_cnx_t* cnx, picoquic_packet_t * old_p, int timer_based_retransmit, uint64_t current_time)
 {
@@ -927,22 +990,28 @@ static void picoquic_count_and_notify_loss(
         }
 
         if (cnx->congestion_alg != NULL && cnx->cnx_state >= picoquic_state_ready && old_p->send_path != NULL) {
-            picoquic_per_ack_state_t ack_state = { 0 };
-            ack_state.pc = old_p->pc;
-            ack_state.rtt_measurement = old_p->send_path->rtt_sample;
-            ack_state.lost_packet_number = old_p->sequence_number;
-            ack_state.lost_packet_sent_time = old_p->send_time;
-            ack_state.nb_bytes_newly_lost = old_p->length;
-            ack_state.nb_bytes_lost_since_packet_sent = (old_p->send_path->total_bytes_lost > old_p->lost_prior) ?
-                old_p->send_path->total_bytes_lost - old_p->lost_prior : old_p->length;
-            ack_state.nb_bytes_delivered_since_packet_sent = (old_p->send_path->delivered > old_p->delivered_prior) ?
-                old_p->send_path->delivered - old_p->delivered_prior : 0;
-            ack_state.inflight_prior = old_p->inflight_prior;
-            ack_state.is_app_limited = old_p->delivered_app_limited;
-            ack_state.is_cwnd_limited = old_p->sent_cwin_limited;
-            cnx->congestion_alg->alg_notify(cnx, old_p->send_path,
-                (timer_based_retransmit == 0) ? picoquic_congestion_notification_repeat : picoquic_congestion_notification_timeout,
-                &ack_state, current_time);
+            /* VipleStream §K.13: 跳過不含可重傳內容的封包遺失壅塞通知。
+             * Datagram + pure-ack frame 的遺失不是壅塞訊號。
+             * 統計計數（nb_losses_found、total_bytes_lost）仍保留，
+             * 以便診斷時觀察實際丟包率。*/
+            if (!picoquic_loss_is_non_congestion(old_p)) {
+                picoquic_per_ack_state_t ack_state = { 0 };
+                ack_state.pc = old_p->pc;
+                ack_state.rtt_measurement = old_p->send_path->rtt_sample;
+                ack_state.lost_packet_number = old_p->sequence_number;
+                ack_state.lost_packet_sent_time = old_p->send_time;
+                ack_state.nb_bytes_newly_lost = old_p->length;
+                ack_state.nb_bytes_lost_since_packet_sent = (old_p->send_path->total_bytes_lost > old_p->lost_prior) ?
+                    old_p->send_path->total_bytes_lost - old_p->lost_prior : old_p->length;
+                ack_state.nb_bytes_delivered_since_packet_sent = (old_p->send_path->delivered > old_p->delivered_prior) ?
+                    old_p->send_path->delivered - old_p->delivered_prior : 0;
+                ack_state.inflight_prior = old_p->inflight_prior;
+                ack_state.is_app_limited = old_p->delivered_app_limited;
+                ack_state.is_cwnd_limited = old_p->sent_cwin_limited;
+                cnx->congestion_alg->alg_notify(cnx, old_p->send_path,
+                    (timer_based_retransmit == 0) ? picoquic_congestion_notification_repeat : picoquic_congestion_notification_timeout,
+                    &ack_state, current_time);
+            }
         }
     }
 }
