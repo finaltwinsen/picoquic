@@ -2809,8 +2809,17 @@ static uint8_t* picoquic_prepare_datagram_ready(picoquic_cnx_t* cnx, picoquic_pa
 {
     uint8_t* bytes0 = bytes_next;
 
-    if (cnx->first_datagram != NULL) {
-        bytes_next = picoquic_format_first_datagram_frame(cnx, bytes_next, bytes_max, is_first_in_packet, more_data, is_pure_ack);
+    /* §5d VipleStream: drain per-path queue before cnx-level queue */
+    if (path_x->first_datagram != NULL) {
+        bytes_next = picoquic_format_first_datagram_frame(cnx,
+            &path_x->first_datagram, &path_x->last_datagram,
+            bytes_next, bytes_max, is_first_in_packet, more_data, is_pure_ack);
+        *more_data |= (path_x->first_datagram != NULL || cnx->first_datagram != NULL);
+    }
+    else if (cnx->first_datagram != NULL) {
+        bytes_next = picoquic_format_first_datagram_frame(cnx,
+            &cnx->first_datagram, &cnx->last_datagram,
+            bytes_next, bytes_max, is_first_in_packet, more_data, is_pure_ack);
         *more_data |= (cnx->first_datagram != NULL);
     }
     else {
@@ -2888,7 +2897,8 @@ uint8_t* picoquic_prepare_stream_and_datagrams(picoquic_cnx_t* cnx, picoquic_pat
         /* Find the highest priority level for which there is something to send, then
         * format the frames to send at that level. Repeat in a loop until the
         * packet is full or there is nothing more to send. */
-        uint64_t datagram_present = cnx->first_datagram != NULL || cnx->is_datagram_ready || path_x->is_datagram_ready;
+        uint64_t datagram_present = cnx->first_datagram != NULL || cnx->is_datagram_ready ||
+            path_x->is_datagram_ready || path_x->first_datagram != NULL;
         picoquic_stream_head_t* first_stream = picoquic_find_ready_stream_path(cnx,
             (cnx->is_multipath_enabled) ? path_x : NULL, 0);
         picoquic_packet_t* first_repeat = picoquic_first_data_repeat_packet(cnx);

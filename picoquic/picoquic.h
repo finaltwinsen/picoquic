@@ -1272,7 +1272,13 @@ int picoquic_queue_misc_frame(picoquic_cnx_t* cnx, const uint8_t* bytes, size_t 
 #define PICOQUIC_DATAGRAM_QUEUE_CAUTIOUS_LENGTH PICOQUIC_ENFORCED_INITIAL_MTU
 int picoquic_queue_datagram_frame(picoquic_cnx_t* cnx, size_t length, const uint8_t* bytes);
 
-/* The incoming packet API is used to pass incoming packets to a 
+/* §5d VipleStream: queue a datagram on a specific path's queue.
+ * When the sender prepares packets for that path it will drain
+ * the per-path queue before the connection-level one. */
+int picoquic_queue_datagram_frame_on_path(picoquic_cnx_t* cnx, int path_index,
+    size_t length, const uint8_t* bytes);
+
+/* The incoming packet API is used to pass incoming packets to a
  * Quic context. The API handles the decryption of the packets
  * and their processing in the context of connections.
  * 

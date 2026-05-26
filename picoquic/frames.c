@@ -5351,25 +5351,62 @@ int picoquic_queue_datagram_frame(picoquic_cnx_t * cnx, size_t length, const uin
     return ret;
 }
 
+/* §5d VipleStream: queue a datagram on a specific path's per-path queue. */
+int picoquic_queue_datagram_frame_on_path(picoquic_cnx_t * cnx, int path_index,
+    size_t length, const uint8_t * src)
+{
+    int ret = 0;
+    PICOQUIC_THREAD_CHECK(cnx->quic);
+
+    if (path_index < 0 || path_index >= cnx->nb_paths || cnx->path[path_index] == NULL) {
+        ret = PICOQUIC_ERROR_PATH_ID_INVALID;
+    }
+    if (ret == 0 && length > PICOQUIC_DATAGRAM_QUEUE_CAUTIOUS_LENGTH) {
+        if (length > cnx->local_parameters.max_datagram_frame_size ||
+            length > cnx->remote_parameters.max_datagram_frame_size ||
+            length + 21 + cnx->quic->local_cnxid_length > cnx->path[path_index]->send_mtu) {
+            ret = PICOQUIC_ERROR_DATAGRAM_TOO_LONG;
+        }
+    }
+    if (ret == 0) {
+        size_t consumed = 0;
+        uint8_t frame_buffer[PICOQUIC_MAX_PACKET_SIZE];
+        int more_data = 0;
+        int is_pure_ack = 1;
+        uint8_t* bytes_next = picoquic_format_datagram_frame(frame_buffer, frame_buffer + sizeof(frame_buffer),
+            &more_data, &is_pure_ack, length, src);
+
+        if ((consumed = bytes_next - frame_buffer) > 0) {
+            picoquic_path_t* path_x = cnx->path[path_index];
+            ret = picoquic_queue_misc_or_dg_frame(cnx, &path_x->first_datagram, &path_x->last_datagram,
+                frame_buffer, consumed, 0, picoquic_packet_context_application);
+        }
+        else {
+            ret = PICOQUIC_ERROR_FRAME_BUFFER_TOO_SMALL;
+        }
+    }
+    return ret;
+}
+
 /* TODO: this overly complicated because of the decision to store
 * datagram frames instead of datagram content in the datagram queue.
 * also, the datagram queue is abused to sent "handshake done"
 */
 
-uint8_t * picoquic_format_first_datagram_frame(picoquic_cnx_t* cnx, uint8_t* bytes,
-    uint8_t *bytes_max, int is_first_in_packet, int * more_data, int * is_pure_ack)
+uint8_t * picoquic_format_first_datagram_frame(picoquic_cnx_t* cnx,
+    picoquic_misc_frame_header_t** first_dg, picoquic_misc_frame_header_t** last_dg,
+    uint8_t* bytes, uint8_t *bytes_max, int is_first_in_packet, int * more_data, int * is_pure_ack)
 {
-    if (bytes + cnx->first_datagram->length <= bytes_max) {
+    if (bytes + (*first_dg)->length <= bytes_max) {
         bytes = picoquic_format_first_misc_or_dg_frame(bytes, bytes_max, more_data, is_pure_ack,
-            cnx->first_datagram, &cnx->first_datagram, &cnx->last_datagram);
+            *first_dg, first_dg, last_dg);
     } else {
         int is_sent = 0;
-        uint8_t* frame_content = ((uint8_t*)cnx->first_datagram) + sizeof(picoquic_misc_frame_header_t);
+        uint8_t* frame_content = ((uint8_t*)(*first_dg)) + sizeof(picoquic_misc_frame_header_t);
 
         if (frame_content[0] == picoquic_frame_type_datagram_l) {
-            /* It might be possible to squeeze the size by removing the length */
             size_t header_length = 1 + picoquic_varint_skip(frame_content + 1);
-            size_t data_length = cnx->first_datagram->length - header_length;
+            size_t data_length = (*first_dg)->length - header_length;
             size_t min_length = data_length + 1;
 
             if (bytes + min_length <= bytes_max) {
@@ -5379,32 +5416,25 @@ uint8_t * picoquic_format_first_datagram_frame(picoquic_cnx_t* cnx, uint8_t* byt
                 *bytes++ = picoquic_frame_type_datagram;
                 memcpy(bytes, frame_content + header_length, data_length);
                 bytes += data_length;
-                picoquic_delete_misc_or_dg(&cnx->first_datagram, &cnx->last_datagram, cnx->first_datagram);
+                picoquic_delete_misc_or_dg(first_dg, last_dg, *first_dg);
                 is_sent= 1;
             }
         }
         if (!is_sent && is_first_in_packet) {
-            /* §K.11 VipleStream fix: picoquic 原本在 is_first_in_packet=true
-             * 且 datagram 放不進去時就直接刪除 datagram。
-             * 但「放不進去」可能只是暫時的擁塞窗口縮小（BBR PROBE_BW 退讓），
-             * 不代表 datagram 真的太大。若 datagram 長度 <= send_mtu，
-             * 保留在 queue 中，等下次 cwin 恢復時再送。
-             * 只有真正超過 MTU 的 datagram 才刪除（永遠不可能送出）。 */
+            /* §K.11 VipleStream fix */
             size_t mtu = cnx->path[0]->send_mtu;
-            size_t dgram_len = cnx->first_datagram->length;
+            size_t dgram_len = (*first_dg)->length;
             if (dgram_len > mtu) {
-                /* 真的比 MTU 大，永遠送不出去，刪除 */
                 picoquic_log_app_message(cnx,
                     "§K.11 Deleting datagram length %zu truly exceeds MTU %zu",
                     dgram_len, mtu);
-                picoquic_delete_misc_or_dg(&cnx->first_datagram, &cnx->last_datagram, cnx->first_datagram);
+                picoquic_delete_misc_or_dg(first_dg, last_dg, *first_dg);
             } else {
-                /* 只是暫時 cwin 不夠（available=%zu），保留 datagram 等下次 */
-                (void)(bytes_max - bytes); /* suppress unused warning */
+                (void)(bytes_max - bytes);
             }
         }
 
-        *more_data |= (cnx->first_datagram != NULL);
+        *more_data |= (*first_dg != NULL);
     }
 
     return bytes;

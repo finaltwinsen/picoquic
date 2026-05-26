@@ -1975,6 +1975,12 @@ static void picoquic_clear_path_data(picoquic_cnx_t* cnx, picoquic_path_t * path
         picoquic_delete_tuple(path_x, path_x->first_tuple, 1);
     }
 
+    /* §5d VipleStream: drain per-path datagram queue */
+    while (path_x->first_datagram != NULL) {
+        picoquic_delete_misc_or_dg(&path_x->first_datagram, &path_x->last_datagram,
+            path_x->first_datagram);
+    }
+
     /* Free the record */
     free(path_x);
 }
