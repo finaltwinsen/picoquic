@@ -2059,8 +2059,23 @@ void picoquic_delete_abandoned_paths(picoquic_cnx_t* cnx, uint64_t current_time,
     while (path_index_current < cnx->nb_paths) {
         /* Demote the path if marked for demotion */
         if (!cnx->path[path_index_current]->path_is_demoted){
+            /* §Q-MP-BACKUP-KEEP: 應用層管理的路徑不受 idle_timeout 清理：
+             *
+             *   1. backup_locked 路徑（failover 備用）——故意不送資料
+             *      （latest_sent_time 不更新），但需要保持存活。
+             *
+             *   2. available 路徑（path_is_backup=0）——正在被排程器
+             *      使用或剛被 failover 升級。latest_sent_time 可能因為
+             *      升級前是 backup 而尚未更新，但不應被 idle timeout
+             *      殺死——應用層 health check 會另行判斷。
+             *
+             * 只有 challenge_failed 和「未鎖定的 idle backup 路徑」
+             * 才進入 demote 流程。 */
+            int is_locked_backup = cnx->path[path_index_current]->path_is_backup_locked;
+            int is_available = !cnx->path[path_index_current]->path_is_backup;
             if (cnx->path[path_index_current]->first_tuple->challenge_failed ||
-                (path_index_current > 0 && cnx->path[path_index_current]->first_tuple->challenge_verified &&
+                (!is_locked_backup && !is_available &&
+                 path_index_current > 0 && cnx->path[path_index_current]->first_tuple->challenge_verified &&
                     current_time - cnx->path[path_index_current]->latest_sent_time >= cnx->idle_timeout)) {
                 picoquic_demote_path(cnx, path_index_current, current_time, 0);
             }
@@ -2125,6 +2140,7 @@ void picoquic_delete_abandoned_paths(picoquic_cnx_t* cnx, uint64_t current_time,
         }
         if (path_left < 0 && path_backup >= 0) {
             cnx->path[path_backup]->path_is_backup = 0;
+            cnx->path[path_backup]->path_is_backup_locked = 0; /* Clear lock on real failover */
             (void)picoquic_queue_path_available_or_backup_frame(cnx, cnx->path[path_backup], picoquic_path_status_available);
         }
     }
@@ -2896,6 +2912,10 @@ int picoquic_set_path_status(picoquic_cnx_t* cnx, uint64_t unique_path_id, picoq
     int path_id = picoquic_get_path_id_from_unique(cnx, unique_path_id);
     if (path_id >= 0) {
         cnx->path[path_id]->path_is_backup = (status != picoquic_path_status_available);
+        /* When application explicitly sets backup, lock it to prevent
+         * auto-promotion in picoquic_verify_path_available().
+         * When application explicitly sets available, unlock it. */
+        cnx->path[path_id]->path_is_backup_locked = (status != picoquic_path_status_available);
         ret = picoquic_queue_path_available_or_backup_frame(cnx, cnx->path[path_id], status);
     }
     return ret;

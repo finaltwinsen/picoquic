@@ -342,7 +342,11 @@ int picoquic_verify_path_available(picoquic_cnx_t* cnx, picoquic_path_t** next_p
             }
             /* track the available paths */
             if (path_x->path_is_backup) {
-                if (backup_index < 0 || path_x->nb_retransmit < best_backup_retransmit) {
+                /* Skip locked-backup paths — application explicitly wants
+                 * them to stay as backup (e.g. VipleStream primary-path mode).
+                 * Only consider unlocked backup paths for auto-promotion. */
+                if (!path_x->path_is_backup_locked &&
+                    (backup_index < 0 || path_x->nb_retransmit < best_backup_retransmit)) {
                     best_backup_retransmit = path_x->nb_retransmit;
                     backup_index = path_index;
                 }

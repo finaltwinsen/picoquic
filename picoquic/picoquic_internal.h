@@ -1104,6 +1104,7 @@ typedef struct st_picoquic_path_t {
     unsigned int mtu_probe_sent : 1;
     unsigned int path_is_published : 1;
     unsigned int path_is_backup : 1;
+    unsigned int path_is_backup_locked : 1; /* Application locked this path as backup; suppress auto-promotion */
     unsigned int path_is_demoted : 1;
     unsigned int path_abandon_received : 1;
     unsigned int path_abandon_sent : 1;
