@@ -30,6 +30,11 @@ extern "C" {
 
 extern picoquic_congestion_algorithm_t* picoquic_bbr_algorithm;
 
+/* VipleStream §K.14: 握手完成後重設 BBR lower bounds 和 cwnd。
+ * 握手期間的封包遺失可能使 cwnd 崩塌，導致第一個 video IDR
+ * frame 無法完整送出。呼叫此函式恢復初始狀態。 */
+void picoquic_bbr_reset_after_handshake(picoquic_cnx_t* cnx);
+
 #ifdef __cplusplus
 }
 #endif

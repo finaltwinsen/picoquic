@@ -104,11 +104,22 @@ typedef enum {
 /* Constants in BBRv3 */
 #define BBRPacingMarginPercent 1 /* discount factor of 1% used to scale BBR.bw to produce BBR.pacing_rate */
 
-#define BBRLossThresh 0.02 /* maximum tolerated packet loss (default: 2%) */
+/* VipleStream §K.16: LAN video streaming 調整。
+ * 原始 BBRv3 常數針對 Internet 流量設計，在 LAN 環境下：
+ * - RACK 計時器精度不足，RTT < 1ms 時產生 ~3% 假陽性遺失
+ * - 2% 門檻被假陽性觸發，導致 cwnd 螺旋式崩塌
+ * - LAN BDP 很小（1Gbps × 0.3ms ≈ 37KB），但 IDR frame 可達 85KB，
+ *   BBR 正常計算的 cwnd（~75KB）不夠一次送完 IDR frame
+ *
+ * 提高 BBRLossThresh 到 10%：LAN 上 <10% 的遺失都是假陽性。
+ * 提高 BBRMinPipeCwnd 到 48：地板 ~69KB，足以容納 1 個 IDR frame
+ * 的 burst delivery。128 已測試造成 client 接收率下降（v1.5.93 回歸）。 */
+#define BBRLossThresh 0.10 /* VipleStream: 0.02 → 0.10 for LAN false-positive tolerance */
 #define BBRStartupFullLossCnt 6 /* discontiguous lost ranges required for startup high-loss exit */
 #define BBRBeta 0.7 /* Multiplicative decrease on packet loss (default: 0.7) */
 #define BBRHeadroom 0.15 /* Realive amount of headroom left for other flows. (default: 0.15). (Erroneously set to 0.85 in draft-bbr-02) */
-#define BBRMinPipeCwnd 4 /* Default to 4*SMSS, i.e, 4*PMTU */
+#define BBRMinPipeCwnd 48 /* VipleStream: 4 → 48 for IDR burst floor (~69KB) */
+#define BBRMinPacingRate 25000000 /* VipleStream §K.18: 200 Mbps in bytes/sec — pacing floor for LAN video */
 
 #define BBRMaxBwFilterLen 2 /* record bw_max for previous cycle and for this one */
 #define BBRExtraAckedFilterLen 10 /* to compute the extra acked parameter */
@@ -662,11 +673,15 @@ static void picoquic_bbr_delete(picoquic_path_t* path_x)
 static void BBRModulateCwndForRecovery(picoquic_bbr_state_t* bbr_state, picoquic_path_t* path_x, bbr_per_ack_state_t * rs)
 {
     if (rs->newly_lost > 0) {
-        if (path_x->cwin > rs->newly_lost + path_x->send_mtu) {
+        /* VipleStream §K.12/§K.16: cwnd 地板 = BBRMinPipeCwnd*MTU。
+         * §K.16 把 BBRMinPipeCwnd 提高到 128（地板 ~185KB），
+         * 確保即使 cwnd 觸底也能 burst 送出 IDR frame (85KB)。 */
+        uint64_t cwnd_floor = BBRMinPipeCwnd * path_x->send_mtu;
+        if (path_x->cwin > rs->newly_lost + cwnd_floor) {
             path_x->cwin = path_x->cwin - rs->newly_lost;
         }
         else {
-            path_x->cwin = path_x->send_mtu;
+            path_x->cwin = cwnd_floor;
         }
     }
     if (bbr_state->packet_conservation && path_x->cwin < (path_x->bytes_in_transit + rs->newly_acked)) {
@@ -785,6 +800,13 @@ static void BBROnEnterFastRecovery(picoquic_bbr_state_t* bbr_state, picoquic_pat
         additional_cwnd = rs->newly_acked;
     }
     path_x->cwin = path_x->bytes_in_transit + additional_cwnd;
+    /* VipleStream §K.12/§K.16: fast recovery 也保底 BBRMinPipeCwnd*MTU */
+    {
+        uint64_t cwnd_floor = BBRMinPipeCwnd * path_x->send_mtu;
+        if (path_x->cwin < cwnd_floor) {
+            path_x->cwin = cwnd_floor;
+        }
+    }
     bbr_state->recovery_packet_number = picoquic_cc_get_sequence_number(path_x->cnx, path_x);
     bbr_state->packet_conservation = 1;
     bbr_state->is_in_recovery = 1;
@@ -805,6 +827,13 @@ static void BBREnterLostFeedback(picoquic_bbr_state_t* bbr_state, picoquic_path_
         /* setting the congestion window to exactly the bytes in transit, thus
          * preventing any further transmission until the condition is lifted */
         path_x->cwin = path_x->bytes_in_transit;
+        /* VipleStream §K.12/§K.16: lost feedback 也保底 BBRMinPipeCwnd*MTU */
+        {
+            uint64_t cwnd_floor = BBRMinPipeCwnd * path_x->send_mtu;
+            if (path_x->cwin < cwnd_floor) {
+                path_x->cwin = cwnd_floor;
+            }
+        }
         bbr_state->is_handling_lost_feedback = 1;
     }
 }
@@ -838,6 +867,15 @@ static void BBROnEnterRTO(picoquic_bbr_state_t* bbr_state, picoquic_path_t* path
             }
         }
         path_x->cwin = path_x->bytes_in_transit + path_x->send_mtu;
+        /* VipleStream §K.12/§K.16: PTO recovery cwnd 保底 BBRMinPipeCwnd*MTU。
+         * 原邏輯 cwnd = bytes_in_transit + send_mtu，若 bytes_in_transit
+         * 接近 0 則 cwnd ≈ 1*MTU，可能造成 negative headroom 死鎖。 */
+        {
+            uint64_t cwnd_floor = BBRMinPipeCwnd * path_x->send_mtu;
+            if (path_x->cwin < cwnd_floor) {
+                path_x->cwin = cwnd_floor;
+            }
+        }
         bbr_state->recovery_packet_number = lost_packet_number;
         bbr_state->is_pto_recovery = 1;
         bbr_state->recovery_delivered = path_x->delivered;
@@ -992,6 +1030,23 @@ static void BBRSetPacingRateWithGain(picoquic_bbr_state_t* bbr_state, double pac
     if (bbr_state->filled_pipe || rate > bbr_state->pacing_rate) {
         bbr_state->pacing_rate = rate;
     }
+
+    /* VipleStream §K.18: Minimum pacing rate floor for LAN video streaming.
+     * During static scenes, the actual data rate drops to ~2 Mbps because
+     * NVENC produces tiny "no change" P-frames. BBR's bandwidth estimate
+     * decays to match, pacing rate drops to ~2 Mbps, and when a larger
+     * frame (IDR or motion P-frame) arrives, pacing spreads the shards
+     * across 50-100ms — far exceeding the 5.55ms frame interval at 180fps.
+     * This triggers an IDR cascade: frame loss → IDR request → IDR also
+     * paced too slowly → IDR incomplete → another IDR request → recv drops
+     * to 3%.
+     *
+     * Floor of 200 Mbps (25 MB/s) ensures any frame (including 85KB IDR)
+     * can be fully paced within one frame interval (85KB / 25MB/s = 3.4ms
+     * < 5.55ms). On Gigabit LAN this is only 20% of link capacity. */
+    if (bbr_state->filled_pipe && bbr_state->pacing_rate < BBRMinPacingRate) {
+        bbr_state->pacing_rate = BBRMinPacingRate;
+    }
 }
 
 static void  BBRSetPacingRate(picoquic_bbr_state_t* bbr_state)
@@ -1102,7 +1157,11 @@ static void BBRAdaptLowerBoundsFromCongestion(picoquic_bbr_state_t* bbr_state, p
 static void  BBRUpdateCongestionSignals(picoquic_bbr_state_t* bbr_state, picoquic_path_t* path_x, bbr_per_ack_state_t * rs)
 {
     BBRUpdateMaxBw(bbr_state, path_x, rs);
-    if (rs->newly_lost > 0) {
+    /* VipleStream §K.16: 在 LAN 環境中 RACK 的低精度會對單一封包產生
+     * 假陽性遺失通報（RTT < 1ms 時計時器 jitter 超過 RTT 本身）。
+     * 要求至少 1 個完整 MTU 以上的遺失量才標記 loss_in_round，
+     * 避免單一封包假陽性觸發 inflight_lo *= 0.7 的連鎖降級。 */
+    if (rs->newly_lost > path_x->send_mtu) {
         bbr_state->loss_in_round = 1;
     }
 #ifdef RTTJitterBufferAdapt
@@ -1124,6 +1183,29 @@ static void BBRResetLowerBounds(picoquic_bbr_state_t* bbr_state)
 {
     bbr_state->bw_lo = UINT64_MAX;
     bbr_state->inflight_lo = UINT64_MAX;
+}
+
+/* VipleStream §K.14: 供外部在握手完成後重設 BBR lower bounds。
+ * 握手期間 CRYPTO frame 遺失（LAN 上常是 RACK 假陽性）會使
+ * BBR 的 inflight_lo 崩塌到極低值，進而壓制 cwnd。呼叫此
+ * 函式重設 inflight_lo / bw_lo 到 UINT64_MAX，讓 slow-start
+ * 從乾淨狀態重新爬升。同時恢復 cwnd 到 PICOQUIC_CWIN_INITIAL。 */
+void picoquic_bbr_reset_after_handshake(picoquic_cnx_t* cnx)
+{
+    if (cnx == NULL || cnx->nb_paths == 0 || cnx->path[0] == NULL)
+        return;
+
+    picoquic_path_t* path_x = cnx->path[0];
+    if (path_x->congestion_alg_state == NULL)
+        return;
+
+    picoquic_bbr_state_t* bbr_state = (picoquic_bbr_state_t*)path_x->congestion_alg_state;
+    BBRResetLowerBounds(bbr_state);
+
+    /* 恢復 cwnd — 握手損失不應永久壓低初始視窗 */
+    if (path_x->cwin < PICOQUIC_CWIN_INITIAL) {
+        path_x->cwin = PICOQUIC_CWIN_INITIAL;
+    }
 }
         
 static void  BBRBoundBWForModel(picoquic_bbr_state_t* bbr_state) {
@@ -2215,8 +2297,10 @@ static void BBRUpdatePtoRecoveryOnRepeatLoss(picoquic_bbr_state_t* bbr_state, pi
     if (path_x->nb_retransmit >= 1 && bbr_state->is_in_recovery && bbr_state->is_pto_recovery) {
         if (path_x->cwin > newly_lost) {
             path_x->cwin -= newly_lost;
-            if (path_x->cwin < 2 * path_x->send_mtu) {
-                path_x->cwin = 2 * path_x->send_mtu;
+            /* VipleStream §K.12/§K.16: 地板統一為 BBRMinPipeCwnd*MTU。 */
+            uint64_t cwnd_floor = BBRMinPipeCwnd * path_x->send_mtu;
+            if (path_x->cwin < cwnd_floor) {
+                path_x->cwin = cwnd_floor;
             }
         }
     }
