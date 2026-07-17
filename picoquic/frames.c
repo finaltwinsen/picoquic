@@ -3883,6 +3883,11 @@ static int picoquic_process_ack_range(
                     }
 
                     picoquic_record_ack_packet_data(packet_data, p);
+                    /* VipleStream §K.9-PAROLE: track largest acked packet size.
+                     * MTU boost 假釋制的正向確認訊號（見 quic_server.cpp）。 */
+                    if ((p->length + p->checksum_overhead) > old_path->max_acked_packet_size) {
+                        old_path->max_acked_packet_size = p->length + p->checksum_overhead;
+                    }
                     /* If packet is larger than the current MTU, update the MTU */
                     if ((p->length + p->checksum_overhead) == old_path->send_mtu) {
                         old_path->nb_mtu_losses = 0;
@@ -5386,6 +5391,60 @@ int picoquic_queue_datagram_frame_on_path(picoquic_cnx_t * cnx, int path_index,
         }
     }
     return ret;
+}
+
+/* VipleStream §AUD-Q-TRIM 2026-07-17: audio datagram 佇列 stale 淘汰。
+ * 07-17 事故：audio 豁免 §Q-STALE 丟棄，在 cnx-level FIFO 無上限積壓
+ * 數秒後以 2.4× 實時排空（93→715 dgram/s），吃滿 DERP 窄路徑並把
+ * video 擠到餓死。audio 是即時媒體，遲到數百 ms 的封包毫無價值——
+ * 這裡提供從最舊端修剪指定 flow 的工具，由 server drain 迴圈呼叫。 */
+int picoquic_queued_datagram_flow(const picoquic_misc_frame_header_t* frame)
+{
+    const uint8_t* bytes = ((const uint8_t*)frame) + sizeof(picoquic_misc_frame_header_t);
+    const uint8_t* bytes_max = bytes + frame->length;
+    uint64_t frame_type = 0;
+    uint64_t content_length = 0;
+
+    if ((bytes = picoquic_frames_varint_decode(bytes, bytes_max, &frame_type)) == NULL ||
+        (frame_type != picoquic_frame_type_datagram &&
+         frame_type != picoquic_frame_type_datagram_l)) {
+        return -1;
+    }
+    if (frame_type == picoquic_frame_type_datagram_l &&
+        (bytes = picoquic_frames_varint_decode(bytes, bytes_max, &content_length)) == NULL) {
+        return -1;
+    }
+    if (bytes >= bytes_max) {
+        return -1;
+    }
+    return bytes[0];
+}
+
+int picoquic_trim_datagram_flow(picoquic_cnx_t* cnx, uint8_t flow_id, size_t max_keep)
+{
+    size_t flow_count = 0;
+    int evicted = 0;
+    picoquic_misc_frame_header_t* frame;
+    PICOQUIC_THREAD_CHECK(cnx->quic);
+
+    for (frame = cnx->first_datagram; frame != NULL; frame = frame->next_misc_frame) {
+        if (picoquic_queued_datagram_flow(frame) == (int)flow_id) {
+            flow_count++;
+        }
+    }
+
+    frame = cnx->first_datagram;
+    while (frame != NULL && flow_count > max_keep) {
+        picoquic_misc_frame_header_t* next = frame->next_misc_frame;
+        if (picoquic_queued_datagram_flow(frame) == (int)flow_id) {
+            picoquic_delete_misc_or_dg(&cnx->first_datagram, &cnx->last_datagram, frame);
+            flow_count--;
+            evicted++;
+        }
+        frame = next;
+    }
+
+    return evicted;
 }
 
 /* TODO: this overly complicated because of the decision to store

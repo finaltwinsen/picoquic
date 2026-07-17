@@ -1205,6 +1205,11 @@ typedef struct st_picoquic_path_t {
 
     /* MTU safety tracking */
     uint64_t nb_mtu_losses;
+    /* VipleStream §K.9-PAROLE: largest (length + checksum_overhead) ever ACKed
+     * on this path. MTU boost 的正向確認訊號：boost 後一段時間內沒有任何
+     * 大包被 ACK，代表大包在路上被黑洞（Tailscale/DERP MTU 1280），撤銷
+     * boost 交還 PMTUD。path 建立時 memset 歸零。 */
+    size_t max_acked_packet_size;
 
     /* Debug MP */
     int lost_after_delivered;
@@ -2140,6 +2145,14 @@ uint8_t* picoquic_format_misc_frames_in_context(picoquic_cnx_t* cnx, uint8_t* by
 int picoquic_queue_misc_or_dg_frame(picoquic_cnx_t* cnx, picoquic_misc_frame_header_t** first, picoquic_misc_frame_header_t** last, const uint8_t* bytes, size_t length, int is_pure_ack, picoquic_packet_context_enum pc);
 void picoquic_purge_misc_frames_after_ready(picoquic_cnx_t* cnx);
 void picoquic_delete_misc_or_dg(picoquic_misc_frame_header_t** first, picoquic_misc_frame_header_t** last, picoquic_misc_frame_header_t* frame);
+/* VipleStream §AUD-Q-TRIM: 解出佇列中 datagram frame 的 payload 首位元組
+ * （VipleStream flow id），非 datagram frame（如被塞進同一佇列的
+ * handshake done）回傳 -1。 */
+int picoquic_queued_datagram_flow(const picoquic_misc_frame_header_t* frame);
+/* VipleStream §AUD-Q-TRIM: 把 cnx-level datagram 佇列中指定 flow 的
+ * frame 數修剪到 max_keep（從最舊端淘汰），回傳淘汰數。
+ * 只能在擁有 quic ctx 的執行緒呼叫。 */
+int picoquic_trim_datagram_flow(picoquic_cnx_t* cnx, uint8_t flow_id, size_t max_keep);
 void picoquic_clear_ack_ctx(picoquic_ack_context_t* ack_ctx);
 void picoquic_reset_ack_context(picoquic_ack_context_t* ack_ctx);
 int picoquic_queue_handshake_done_frame(picoquic_cnx_t* cnx);
