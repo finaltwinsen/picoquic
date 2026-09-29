@@ -390,6 +390,10 @@ void picoquic_sort_available_paths(picoquic_cnx_t* cnx, uint64_t current_time, u
     uint64_t last_sent_cwin = UINT64_MAX;
     int i_min_rtt = -1;
     int is_min_rtt_pacing_ok = 0;
+    /* VipleStream §MP-PERPATH-DG: path whose own per-path datagram queue is non-empty
+     * and that pacing and cwin allow to send now (oldest last_sent wins). */
+    int data_path_dg = -1;
+    uint64_t last_sent_dg = UINT64_MAX;
     int is_ack_needed = 0;
     picoquic_stream_head_t* next_stream = picoquic_find_ready_stream(cnx);
     int affinity_path_id = -1;
@@ -430,6 +434,10 @@ void picoquic_sort_available_paths(picoquic_cnx_t* cnx, uint64_t current_time, u
                     last_sent_cwin = path_x->last_sent_time;
                     data_path_cwin = path_index;
                 }
+                if (path_x->first_datagram != NULL && path_x->last_sent_time < last_sent_dg) {
+                    last_sent_dg = path_x->last_sent_time;
+                    data_path_dg = path_index;
+                }
                 if (affinity_path_id < 0) {
                     /* we select here the first path that is either ready to send on
                         * the highest priority stream with affinity on this path, or
@@ -460,7 +468,11 @@ void picoquic_sort_available_paths(picoquic_cnx_t* cnx, uint64_t current_time, u
         cnx->path[i_min_rtt]->is_nominal_ack_path = 1;
     }
 
-    if (is_ack_needed && is_min_rtt_pacing_ok) {
+    if (data_path_dg >= 0 && data_path_dg != i_min_rtt) {
+        /* VipleStream §MP-PERPATH-DG: per-path datagrams can only leave on their path. */
+        *next_path = cnx->path[data_path_dg];
+    }
+    else if (is_ack_needed && is_min_rtt_pacing_ok) {
         *next_path = cnx->path[i_min_rtt];
     }
     else if (data_path_cwin >= 0) {

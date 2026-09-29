@@ -4210,6 +4210,28 @@ int picoquic_prepare_packet_ex(picoquic_cnx_t* cnx,
         }
     }
 
+    /* VipleStream §MP-PERPATH-WAKE: datagrams queued on a specific path only leave when
+     * that path is prepared. When the scheduler picked another path (ACK / min RTT) and
+     * found nothing to send, the wake time came from that path's timers only, so the
+     * connection slept with a full per-path queue (~70 prepares/s, server video starved,
+     * client gave up after 16 s). Wake again as soon as pacing allows such a path to send;
+     * paths.c §MP-PERPATH-DG then selects it. */
+    if (ret == 0 && cnx->is_multipath_enabled && cnx->nb_paths > 1 &&
+        next_wake_time > current_time && cnx->cnx_state == picoquic_state_ready) {
+        for (int i = 0; i < cnx->nb_paths; i++) {
+            picoquic_path_t* p = cnx->path[i];
+            if (p == NULL || p->first_datagram == NULL || p->path_is_backup || p->path_is_demoted ||
+                !p->first_tuple->challenge_verified || p->bytes_in_transit >= p->cwin) {
+                continue;
+            }
+            if (picoquic_is_sending_authorized_by_pacing(cnx, p, current_time, &next_wake_time)) {
+                next_wake_time = current_time;
+                SET_LAST_WAKE(cnx->quic, PICOQUIC_SENDER);
+                break;
+            }
+        }
+    }
+
     if (ret == 0) {
         ret = picoquic_program_app_wake_time(cnx, &next_wake_time);
     }
