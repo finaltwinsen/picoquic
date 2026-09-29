@@ -1245,6 +1245,14 @@ typedef struct st_picoquic_path_t {
     picoquic_misc_frame_header_t* first_datagram;
     picoquic_misc_frame_header_t* last_datagram;
 
+    /* VipleStream §Q-MTU-PIN: the application boosted send_mtu to 1500 and vouches for it.
+     * Loss-triggered MTU resets are skipped (nb_mtu_losses still counts, so the app can
+     * detect a real black hole and clear this flag). Without it a spurious PTO drops
+     * send_mtu to 1232 until the app re-boosts, and datagrams larger than that at the
+     * head of the queue are deleted in picoquic_format_first_datagram_frame.
+     * Kept last so every earlier member keeps its offset. */
+    uint8_t viple_mtu_pinned;
+
 } picoquic_path_t;
 
 /* Crypto context. There are four such contexts:

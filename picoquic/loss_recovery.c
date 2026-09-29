@@ -877,7 +877,8 @@ static void picoquic_check_path_mtu_on_losses(
         ((old_p->length + old_p->checksum_overhead) == old_p->send_path->send_mtu || timer_based_retransmit) &&
         cnx->cnx_state >= picoquic_state_ready) {
         old_p->send_path->nb_mtu_losses++;
-        if (old_p->send_path->nb_mtu_losses > PICOQUIC_MTU_LOSS_THRESHOLD || timer_based_retransmit) {
+        if ((old_p->send_path->nb_mtu_losses > PICOQUIC_MTU_LOSS_THRESHOLD || timer_based_retransmit) &&
+            !old_p->send_path->viple_mtu_pinned /* VipleStream §Q-MTU-PIN */) {
             size_t old_mtu = old_p->send_path->send_mtu;
             picoquic_reset_path_mtu(old_p->send_path);
             if (old_mtu != old_p->send_path->send_mtu) {
